@@ -231,6 +231,25 @@ The dynamic control flow is captured correctly. We can verify in backends with d
     #       [37, 37, 37]], dtype=int64)]
 
 
+To avoid exporting a variable scalar tensor as a fixed value constant as part of the ONNX model, please
+avoid use of ``torch.Tensor.item()``. Torch supports implicit cast of single-element tensors to numbers.
+E.g.: ::
+
+    class LoopModel(torch.nn.Module):
+        def forward(self, x, y):
+            res = []
+            arr = x.split(2, 0)
+            for i in range(int(y)):
+                res += [arr[i].sum(0, False)]
+            return torch.stack(res)
+
+    model = torch.jit.script(LoopModel())
+    inputs = (torch.randn(16), torch.tensor(8))
+
+    out = model(*inputs)
+    torch.onnx.export(model, inputs, 'loop_and_list.onnx', opset_version=11, example_outputs=out)
+
+
 TorchVision support
 -------------------
 
@@ -262,6 +281,7 @@ The following operators are supported:
 * Conv
 * Dropout
 * Embedding (no optional arguments supported)
+* EmbeddingBag
 * FeatureDropout (training mode not supported)
 * Index
 * MaxPool1d
@@ -289,6 +309,7 @@ The following operators are supported:
 * avg_pool2d
 * avg_pool2d
 * avg_pool3d
+* as_strided
 * baddbmm
 * bitshift
 * cat
@@ -314,6 +335,7 @@ The following operators are supported:
 * exp
 * expand
 * expand_as
+* eye
 * flatten
 * floor
 * floor_divide
@@ -335,9 +357,11 @@ The following operators are supported:
 * instance_norm
 * interpolate
 * isnan
+* KLDivLoss
 * layer_norm
 * le
 * leaky_relu
+* len
 * log
 * log1p
 * log2
@@ -358,6 +382,9 @@ The following operators are supported:
 * narrow
 * ne
 * neg
+* new_empty
+* new_full
+* new_zeros
 * nll_loss
 * nonzero
 * norm
@@ -601,10 +628,13 @@ you can create and register your own custom ops implementation in PyTorch. Here'
             return torch.ops.custom_ops.foo_forward(input1, input2, self.attr1, self.attr2)
 
     model = FooModel(attr1, attr2)
-    torch.onnx.export(model, (dummy_input1, dummy_input2), 'model.onnx')
+    torch.onnx.export(model, (dummy_input1, dummy_input2), 'model.onnx', custom_opsets={"custom_domain": 2})
 
 Depending on the custom operator, you can export it as one or a combination of existing ONNX ops.
-You can also export it as a custom op in ONNX as well. In that case, you will need to extend the backend of your choice
+You can also export it as a custom op in ONNX as well. In that case, you can specify the custom domain
+and version (custom opset) using the ``custom_opsets`` dictionary at export. If not
+explicitly specified, the custom opset version is set to 1 by default.
+Using custom ONNX ops, you will need to extend the backend of your choice
 with matching custom ops implementation, e.g. `Caffe2 custom ops <https://caffe2.ai/docs/custom-operators.html>`_,
 `ONNX Runtime custom ops <https://github.com/microsoft/onnxruntime/blob/master/docs/AddingCustomOp.md>`_.
 
@@ -808,7 +838,10 @@ Q: Is tensor list exportable to ONNX?
 
   Yes, this is supported now for ONNX opset version >= 11. ONNX introduced the concept of Sequence in opset 11.
   Similar to list, Sequence is a data type that contains arbitrary number of Tensors.
-  Associated operators are also introduced in ONNX, such as SequenceInsert, SequenceAt, etc. E.g.: ::
+  Associated operators are also introduced in ONNX, such as SequenceInsert, SequenceAt, etc.
+  However, in-place list append within loops is not exportable to ONNX. To implement this, please use inplace
+  add operator.
+  E.g.: ::
 
     class ListLoopModel(torch.nn.Module):
         def forward(self, x):
@@ -817,8 +850,8 @@ Q: Is tensor list exportable to ONNX?
             arr = x.split(2, 0)
             res2 = torch.zeros(3, 4, dtype=torch.long)
             for i in range(len(arr)):
-                res = res.append(arr[i].sum(0, False))
-                res1 = res1.append(arr[-1 - i].sum(0, False))
+                res += [arr[i].sum(0, False)]
+                res1 += [arr[-1 - i].sum(0, False)]
                 res2 += 1
             return torch.stack(res), torch.stack(res1), res2
 
@@ -836,6 +869,32 @@ Q: Is tensor list exportable to ONNX?
     })
 
     assert [torch.allclose(o, torch.tensor(o_ort)) for o, o_ort in zip(out, out_ort)]
+
+Use external data format
+------------------------
+``use_external_data_format`` argument in export API enables export of models in ONNX external
+data format. With this option enabled, the exporter stores some model parameters in external
+binary files, rather than the ONNX file itself. These external binary files are stored in the
+same location as the ONNX file. Argument 'f' must be a string specifying the location of the model. ::
+
+    model = torchvision.models.mobilenet_v2(pretrained=True)
+    input = torch.randn(2, 3, 224, 224, requires_grad=True)
+    torch.onnx.export(model, (input, ), './large_model.onnx', use_external_data_format=True)
+
+
+This argument enables export of large models to ONNX. Models larger than 2GB cannot be exported
+in one file because of the protobuf size limit. Users should set ``use_external_data_format`` to
+``True`` to successfully export such models.
+
+Training
+--------
+``Training`` argument in export API allows users to export models in a training-friendly mode.
+``TrainingMode.TRAINING`` exports model in a training-friendly mode that avoids certain model
+optimizations which might interfere with model parameter training. ``TrainingMode.PRESERVE``
+exports the model in inference mode if ``model.training`` is ``False``. Otherwise, it exports
+the model in a training-friendly mode.
+The default mode for this argument is ``TrainingMode.EVAL`` which exports the model in
+inference mode.
 
 Functions
 --------------------------

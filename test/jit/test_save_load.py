@@ -5,6 +5,7 @@ import random
 import torch
 from itertools import product as product
 from torch import Tensor
+from torch.testing._internal.common_utils import TemporaryFileName
 from typing import NamedTuple
 
 # Make the helper files in test/ importable
@@ -127,8 +128,7 @@ class TestSaveLoad(JitTestCase):
         except Exception as e:
             self.skipTest("Failed to load fixture!")
 
-        self._verify_no("aten::div", v3_module)
-        self._verify_count("aten::true_divide", v3_module, 3)
+        self._verify_count("aten::div", v3_module, 3)  # true_divide aliases to div
         self._verify_count("aten::floor_divide", v3_module, 3)
 
         current_module = self._save_load_module(MyModule)
@@ -171,8 +171,7 @@ class TestSaveLoad(JitTestCase):
         except Exception as e:
             self.skipTest("Failed to load fixture!")
 
-        self._verify_no("aten::div", v3_module)
-        self._verify_count("aten::true_divide", v3_module, 1)
+        self._verify_count("aten::div", v3_module, 1)  # true_divide aliases to div
         self._verify_count("aten::floor_divide", v3_module, 1)
 
         current_module = self._save_load_module(MyModule)
@@ -217,8 +216,7 @@ class TestSaveLoad(JitTestCase):
         except Exception as e:
             self.skipTest("Failed to load fixture!")
 
-        self._verify_no("aten::div", v3_module)
-        self._verify_count("aten::true_divide", v3_module, 1)
+        self._verify_count("aten::div", v3_module, 1)  # true_divide aliases to div
         self._verify_count("aten::floor_divide", v3_module, 1)
 
         current_module = self._save_load_module(MyModule)
@@ -277,8 +275,7 @@ class TestSaveLoad(JitTestCase):
             self.skipTest("Failed to load fixture!")
 
         for m in (v3_module_float, v3_module_int):
-            self._verify_no("aten::div", m)
-            self._verify_count("aten::true_divide", m, 1)
+            self._verify_count("aten::div", m, 1)  # true_divide aliases to div
             self._verify_count("aten::floor_divide", m, 1)
 
         current_module_float = self._save_load_module(MyModuleFloat)
@@ -413,8 +410,7 @@ class TestSaveLoad(JitTestCase):
             self.skipTest("Failed to load fixture!")
 
         for m in (v3_module_float, v3_module_int):
-            self._verify_no("aten::div", m)
-            self._verify_count("aten::true_divide", m, 1)
+            self._verify_count("aten::div", m, 1)  # true_divide aliases to div
             self._verify_count("aten::floor_divide", m, 1)
 
         current_module_float = self._save_load_module(MyModuleFloat)
@@ -479,6 +475,75 @@ class TestSaveLoad(JitTestCase):
                 self.assertEqual(mr, hr)
 
         _helper(v3_module, current_module)
+
+    # NOTE: the JIT was incapable of handling boolean fill values when
+    #   PyTorch produced file format versions 0-4
+    def test_versioned_full_integer_value(self):
+        class MyModule(torch.nn.Module):
+            def __init__(self):
+                super(MyModule, self).__init__()
+
+            def forward(self, int_fill: int):
+                size = torch.Size(2, 2)
+                a = torch.full(size, int_fill)
+                b = torch.full(size, 1)
+                return (a, b)
+
+        try:
+            v4_module = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_full_integer_value_v4.pt")
+        except Exception as e:
+            self.skipTest("Failed to load fixture!")
+
+        self._verify_count("aten::full", v4_module, 2)
+
+        current_module = self._save_load_module(MyModule)
+        self._verify_count("aten::full", current_module, 2)
+
+        # Verifies historic integer type inference is float
+        # NOTE: only verifies floating point, not exact dtype, due to
+        #   https://github.com/pytorch/pytorch/issues/40470
+        results = v4_module(2)
+        for result in results:
+            self.assertTrue(result.is_floating_point())
+
+        # Verifies values are correct
+        a, b = results
+        self.assertTrue((a == 2.).all())
+        self.assertTrue((b == 1.).all())
+
+    # Tests that torch.full behavior which is the same from prior versions
+    #   to version 5 is preserved.
+    # NOTE: while torch.full in eager PyTorch accepts a requires_grad argument,
+    #   it does not in Torchscript (see https://github.com/pytorch/pytorch/issues/40363)
+    def test_versioned_full_preserved(self):
+        class MyModule(torch.nn.Module):
+            def __init__(self):
+                super(MyModule, self).__init__()
+
+            def forward(self, float_fill: float):
+                size = (2, 2)
+                a = torch.full(size, 1.)
+                b = torch.full(size, float_fill)
+                c = torch.full(size, float_fill, dtype=torch.long)
+
+                out = torch.empty(size, dtype=torch.long)
+                d = torch.full(size, float_fill, out=out)
+
+                e = torch.full(size, float_fill, dtype=torch.float16, pin_memory=None,
+                               layout=torch.strided, device='cpu')
+                return (a, b, c, d, e)
+
+        try:
+            v4_module = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_full_preserved_v4.pt")
+        except Exception as e:
+            self.skipTest("Failed to load fixture!")
+
+        self._verify_count("aten::full", v4_module, 5)
+
+        current_module = self._save_load_module(MyModule)
+        self._verify_count("aten::full", current_module, 5)
+
+        self.assertEqual(v4_module(2.), current_module(2.))
 
     def test_versioned_symbols_reserialization(self):
         """
@@ -805,3 +870,53 @@ class TestSaveLoad(JitTestCase):
         torch.jit.save(sm, contains_both)
         contains_both.seek(0)
         sm = torch.jit.load(contains_both)
+
+    def test_save_load_with_extra_files(self):
+        class MyMod(torch.jit.ScriptModule):
+            @torch.jit.script_method
+            def forward(self, a):
+                return a
+
+        # specifically test binary data
+        value = b"bar\x00\xffbaz"
+
+        expected_extra_files = {}
+        expected_extra_files['foo'] = value
+        # verify that str to bytes conversion also works
+        expected_extra_files['foo2'] = "bar"
+        m = MyMod()
+
+        # Save to file.
+        with TemporaryFileName() as fname:
+            m.save(fname, _extra_files=expected_extra_files)
+            # values don't matter
+            extra_files = {'foo': '', 'foo2': None}
+            torch.jit.load(fname, _extra_files=extra_files)
+            self.assertEqual(value, extra_files['foo'])
+            # results come back always as bytes
+            self.assertEqual(b"bar", extra_files['foo2'])
+
+            # Use torch.jit API
+            torch.jit.save(m, fname, _extra_files=expected_extra_files)
+            extra_files['foo'] = ''
+            torch.jit.load(fname, _extra_files=extra_files)
+            self.assertEqual(value, extra_files['foo'])
+
+        # Save to buffer.
+        buffer = io.BytesIO(m.save_to_buffer(_extra_files=expected_extra_files))
+        extra_files = {'foo': ''}
+        torch.jit.load(buffer, _extra_files=extra_files)
+        self.assertEqual(value, extra_files['foo'])
+
+        # Use torch.jit API
+        buffer = io.BytesIO()
+        torch.jit.save(m, buffer, _extra_files=expected_extra_files)
+        buffer.seek(0)
+        extra_files = {'foo': ''}
+        torch.jit.load(buffer, _extra_files=extra_files)
+        self.assertEqual(value, extra_files['foo'])
+
+        # Non-existent file 'bar'
+        with self.assertRaises(RuntimeError):
+            extra_files['bar'] = ''
+            torch.jit.load(buffer, _extra_files=extra_files)
